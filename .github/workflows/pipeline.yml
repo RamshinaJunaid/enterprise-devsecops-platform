@@ -12,6 +12,11 @@ env:
   ECS_CLUSTER: devsecops-cluster
   ECS_TASK_DEFINITION: devsecops-app-task
 
+# Required permissions for GitHub OIDC authentication
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   build-and-deploy:
     name: Build, Scan, and Deploy
@@ -21,8 +26,8 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@v3
 
-    # 1. Automate application testing and code security scanning
-    - name: Run Code Security Scan (Trivy SAST)
+    # 1. Run Code & Dependency Security Scan (Trivy SCA/SAST)
+    - name: Run File-System Security Scan
       uses: aquasecurity/trivy-action@master
       with:
         scan-type: 'fs'
@@ -30,18 +35,18 @@ jobs:
         exit-code: '1'
         severity: 'CRITICAL,HIGH'
 
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v2
+    # 2. Configure AWS Credentials using OIDC (No long-lived keys!)
+    - name: Configure AWS Credentials via OIDC
+      uses: aws-actions/configure-aws-credentials@v3
       with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        role-to-assume: arn:aws:iam::YOUR_AWS_ACCOUNT_ID:role/devsecops-github-actions-role
         aws-region: ${{ env.AWS_REGION }}
 
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
 
-    # 2. Build Docker image automatically
+    # 3. Build Docker Image
     - name: Build and Tag Docker Image
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -50,16 +55,16 @@ jobs:
         docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
         docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
 
-    # 3. Scan container image for vulnerabilities
+    # 4. Run Container Security Scan (Blocking on HIGH/CRITICAL)
     - name: Run Container Security Scan
       uses: aquasecurity/trivy-action@master
       with:
         image-ref: '${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}'
         format: 'table'
-        exit-code: '0' 
+        exit-code: '1' 
         severity: 'CRITICAL,HIGH'
 
-    # 4. Push image to ECR
+    # 5. Push Docker Image to ECR
     - name: Push Docker Image to ECR
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -68,7 +73,7 @@ jobs:
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-    # 5. Deploy application to ECS/Fargate
+    # 6. Deploy Application to ECS/Fargate
     - name: Download current ECS task definition
       run: |
         aws ecs describe-task-definition --task-definition ${{ env.ECS_TASK_DEFINITION }} --query taskDefinition > task-definition.json
@@ -88,3 +93,19 @@ jobs:
         service: ${{ env.ECS_SERVICE }}
         cluster: ${{ env.ECS_CLUSTER }}
         wait-for-service-stability: true
+
+    # 7. Application Health Verification (Smoke Test)
+    - name: Application Health Verification
+      run: |
+        echo "Retrieving ALB DNS Name..."
+        ALB_DNS=$(aws elbv2 describe-load-balancers --names devsecops-alb --query 'LoadBalancers[0].DNSName' --output text)
+        echo "Testing endpoint: http://$ALB_DNS"
+        echo "Waiting 30 seconds for target group health checks to pass..."
+        sleep 30
+        CURL_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://$ALB_DNS)
+        if [ "$CURL_STATUS" -eq 200 ]; then
+          echo "Health check passed! The application is responding with HTTP 200 OK."
+        else
+          echo "Health check failed with status $CURL_STATUS. The application might be unhealthy."
+          exit 1
+        fi
